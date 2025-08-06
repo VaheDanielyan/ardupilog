@@ -125,7 +125,7 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
             % Try ultra-fast C parsing of entire log
             if exist('ardupilot_parse_log', 'file') == 3
                 try
-                    fprintf('Using C parser for entire log...\n');
+                    fprintf('Using ultra-fast C parser for entire log...\n');
                     logData = ardupilot_parse_log(obj.log_data, obj.header, obj.msgFilter);
                     obj.processLogDataFromC(logData);
                     % Use the SAME post-processing as MATLAB parser for consistency
@@ -249,6 +249,16 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                 end
             end
             
+            % Handle message instances for ALL parsers (both C and MATLAB)
+            % This ensures multiple sensor instances (IMU_1, IMU_2, etc.) are properly separated
+            propNames = properties(obj);
+            for i = 1:length(propNames)
+                propName = propNames{i};
+                if isa(obj.(propName),'LogMsgGroup') && obj.(propName).data_len > 0
+                    obj.addLogMsgGroupInstances(obj.(propName));
+                end
+            end
+            
             % Delete corrupt timestamps for all messages
             propNames = properties(obj);
             for i = 1:length(propNames)
@@ -280,9 +290,6 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
             
             fprintf('Processing %d message types from C parser...\n', length(logData.fmt_messages));
             
-            % Initialize valid_msgheader_cell for compatibility with finalizeLogProcessing
-            obj.valid_msgheader_cell = {};
-            
             % Create LogMsgGroups from FMT data
             for i = 1:length(logData.fmt_messages)
                 fmt = logData.fmt_messages(i);
@@ -311,15 +318,16 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                             % Data is already in correct format from C
                             obj.(newName).storeData(logData.message_data{i}');
                             
-                            % Set up valid_msgheader_cell for finalizeLogProcessing compatibility
                             if i <= length(logData.message_indices) && ~isempty(logData.message_indices{i})
-                                messageIndices = logData.message_indices{i};
-                                % Safely add to valid_msgheader_cell
-                                row_idx = size(obj.valid_msgheader_cell, 1) + 1;
-                                obj.valid_msgheader_cell{row_idx, 1} = newType;
-                                obj.valid_msgheader_cell{row_idx, 2} = messageIndices(:)';
+                                lineNumbers = logData.message_indices{i};
+                                obj.(newName).setLineNo(lineNumbers(:));
                             end
+                            
+                            fprintf('  %s: %d messages\n', newName, length(logData.message_indices{i}));
                         end
+                        
+                        % CRITICAL: Check if message is instanced and create separate instances
+                        obj.addLogMsgGroupInstances(obj.(newName));
                         
                         % Add to fmt_cell for compatibility
                         obj.fmt_cell = [obj.fmt_cell; {newType, newName, newLen}];
@@ -337,7 +345,7 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                     end
                 end
             end
-            
+
             % Update message count
             obj.numMsgs = 0;
             propNames = properties(obj);
@@ -348,7 +356,10 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                 end
             end
             
-            fprintf('C parser extracted data for %d message types. Post-processing will handle instances and final setup...\n', length(obj.fmt_cell));
+            fprintf('C parser processed %d total messages across %d types\n', obj.numMsgs, length(obj.fmt_cell));
+            
+            % Handle post-processing that C parser doesn't do
+            obj.finalizeLogProcessing();
         end
         
         function headerIndices = discoverValidMsgHeaders(obj,msgId,msgLen,headerIndices)

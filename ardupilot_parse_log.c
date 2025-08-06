@@ -1,4 +1,4 @@
-2/*
+/*
  * ardupilot_parse_log.c - ArduPilot log parser MEX function
  */
 

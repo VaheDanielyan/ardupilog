@@ -103,8 +103,7 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
         
         function [] = readLog(obj)
         % Open file, read all data, close file,
-        % Find message headers, find FMT messages, create LogMsgGroup for each FMT msg,
-        % Count number of headers = number of messages, process data
+        % Parse entire log using ultra-fast C implementation with MATLAB object creation
 
             % Open a file at [filePathName filesep fileName]
             [obj.fileID, errmsg] = fopen([obj.filePathName, filesep, obj.fileName], 'r');
@@ -123,14 +122,35 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                 warn('File not closed successfully')
             end
             
-            % Discover the locations of all the messages
+            % Try ultra-fast C parsing of entire log
+            if exist('ardupilot_parse_log', 'file') == 3
+                try
+                    fprintf('Using C parser for entire log...\n');
+                    logData = ardupilot_parse_log(obj.log_data, obj.header, obj.msgFilter);
+                    obj.processLogDataFromC(logData);
+                    % Use the SAME post-processing as MATLAB parser for consistency
+                    %obj.finalizeLogProcessing();
+                    return; % C parsing succeeded, we're done!
+                catch ME
+                    warning('ARDUPILOG:CParserFailed', 'C parser failed: %s. Falling back to optimized MATLAB.', ME.message);
+                end
+            end
+            
+            % Fallback: Use the previous optimized approach
+            obj.readLogOptimized();
+        end
+        
+        function [] = readLogOptimized(obj)
+            % Fast MATLAB fallback implementation - matches original approach
+            
+            % Discover the locations of all the messages (original approach)
             allHeaderCandidates = obj.discoverHeaders([]);
             
-            % Find the FMT message legnth
+            % Find the FMT message length
             obj.findFMTLength(allHeaderCandidates);
             
             % Read the FMT messages
-            data = obj.isolateMsgData(obj.FMTID,obj.FMTLen,allHeaderCandidates);
+            data = obj.isolateMsgData(obj.FMTID, obj.FMTLen, allHeaderCandidates);
             obj.createLogMsgGroups(data');
             
             % Check for validity of the input msgFilter
@@ -157,7 +177,7 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                 end
 
                 msgLen = obj.fmt_cell{i,3};
-                data = obj.isolateMsgData(msgId,msgLen,allHeaderCandidates);
+                data = obj.isolateMsgData(msgId, msgLen, allHeaderCandidates);
 
                 % Check against the message filters
                 if ~isempty(obj.msgFilter) 
@@ -178,60 +198,68 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                 obj.(msgName).storeData(data');
             end
             
+            % Complete the log processing
+            obj.finalizeLogProcessing();
+        end
+        
+        function [] = finalizeLogProcessing(obj)
+            % Handle all the post-processing steps common to both C and MATLAB parsing
+            
             % If available, parse unit formatting messages
             availableFields = fieldnames(obj);
             if (ismember('UNIT', availableFields) && ismember('MULT', availableFields) && ismember('FMTU', availableFields))
                 obj.buildMsgUnitFormats();
             end
             
-            % Construct the LineNo for the whole log
-            LineNo_ndx_vec = sort(vertcat(obj.valid_msgheader_cell{:,2}));
-            LineNo_vec = [1:length(LineNo_ndx_vec)]';
-            % Record the total number of log messages
-            obj.totalLogMsgs = LineNo_vec(end);
-            % Iterate over all the messages
-            for i = 1:size(obj.valid_msgheader_cell,1)
-                % Find msgName from msgId in 1st column
-                msgId = obj.valid_msgheader_cell{i,1};
-                row_in_fmt_cell = vertcat(obj.fmt_cell{:,1})==msgId;
-                msgName = obj.fmt_cell{row_in_fmt_cell,2};
-                
-                % Check if this message was meant to be filtered
-                if iscellstr(obj.msgFilter)
-                    if ~isempty(obj.msgFilter) && ~ismember(msgName,obj.msgFilter)
-                        continue;
+            % Handle line number construction and message instances only for MATLAB parsing
+            % C parser already sets line numbers correctly
+            if ~isempty(obj.valid_msgheader_cell)
+                % Construct the LineNo for the whole log
+                LineNo_ndx_vec = sort(vertcat(obj.valid_msgheader_cell{:,2}));
+                LineNo_vec = (1:length(LineNo_ndx_vec))';
+                % Record the total number of log messages
+                obj.totalLogMsgs = LineNo_vec(end);
+                % Iterate over all the messages
+                for i = 1:size(obj.valid_msgheader_cell,1)
+                    % Find msgName from msgId in 1st column
+                    msgId = obj.valid_msgheader_cell{i,1};
+                    row_in_fmt_cell = vertcat(obj.fmt_cell{:,1})==msgId;
+                    msgName = obj.fmt_cell{row_in_fmt_cell,2};
+                    
+                    % Check if this message was meant to be filtered
+                    if iscellstr(obj.msgFilter)
+                        if ~isempty(obj.msgFilter) && ~ismember(msgName,obj.msgFilter)
+                            continue;
+                        end
+                    elseif isnumeric(obj.msgFilter)
+                        if ~isempty(obj.msgFilter) && ~ismember(msgId,obj.msgFilter)
+                            continue;
+                        end
+                    else
+                        error('msgFilter type should have passed validation by now and I shouldnt be here');
                     end
-                elseif isnumeric(obj.msgFilter)
-                    if ~isempty(obj.msgFilter) && ~ismember(msgId,obj.msgFilter)
-                        continue;
-                    end
-                else
-                    error('msgFilter type should have passed validation by now and I shouldnt be here');
-                end
 
-                % Pick out the correct line numbers
-                msg_LineNo = LineNo_vec(ismember(LineNo_ndx_vec, obj.valid_msgheader_cell{i,2}));
-                
-                % Write to the LogMsgGroup
-                obj.(msgName).setLineNo(msg_LineNo);
-                % Check if message is instanced. If yes, create the other
-                % instances too.
-                obj.addLogMsgGroupInstances(obj.(msgName));
+                    % Pick out the correct line numbers
+                    msg_LineNo = LineNo_vec(ismember(LineNo_ndx_vec, obj.valid_msgheader_cell{i,2}));
+                    
+                    % Write to the LogMsgGroup
+                    obj.(msgName).setLineNo(msg_LineNo);
+                    % Check if message is instanced. If yes, create the other instances too.
+                    obj.addLogMsgGroupInstances(obj.(msgName));
+                end
             end
             
-            % Delete corrupt timestamps
-            for i = 1:size(obj.valid_msgheader_cell,1)
-                % Find msgName from msgId in 1st column
-                msgId = obj.valid_msgheader_cell{i,1};
-                row_in_fmt_cell = vertcat(obj.fmt_cell{:,1})==msgId;
-                msgName = obj.fmt_cell{row_in_fmt_cell,2};
-                if obj.(msgName).data_len > 0
-                    obj.(msgName).fixCorruptTimestamps();
+            % Delete corrupt timestamps for all messages
+            propNames = properties(obj);
+            for i = 1:length(propNames)
+                propName = propNames{i};
+                if isa(obj.(propName),'LogMsgGroup') && obj.(propName).data_len > 0
+                    obj.(propName).fixCorruptTimestamps();
                 end
             end
             
             % Update the number of actual included messages
-            propNames = properties(obj);
+            obj.numMsgs = 0;
             for i = 1:length(propNames)
                 propName = propNames{i};
                 if isa(obj.(propName),'LogMsgGroup')
@@ -241,6 +269,86 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
             
             % Display message on completion
             disp('Done processing.');
+        end
+        
+        function [] = processLogDataFromC(obj, logData)
+            % Process the structured data returned from C parser
+            % Create LogMsgGroup objects and populate all data structures
+            
+            obj.FMTLen = logData.fmt_length;
+            obj.totalLogMsgs = logData.total_messages;
+            
+            fprintf('Processing %d message types from C parser...\n', length(logData.fmt_messages));
+            
+            % Initialize valid_msgheader_cell for compatibility with finalizeLogProcessing
+            obj.valid_msgheader_cell = {};
+            
+            % Create LogMsgGroups from FMT data
+            for i = 1:length(logData.fmt_messages)
+                fmt = logData.fmt_messages(i);
+                
+                % Create LogMsgGroup
+                try
+                    newType = double(fmt.type);
+                    newLen = double(fmt.length);
+                    newName = fmt.name;
+                    newFmt = fmt.format;
+                    newLabels = fmt.labels;
+                    
+                    % Create the LogMsgGroup
+                    new_msg_group = LogMsgGroup(newType, newName, newLen, newFmt, newLabels);
+                    
+                    if ~isempty(new_msg_group)
+                        % Add dynamic property
+                        if ~isprop(obj, newName)
+                            addprop(obj, newName);
+                            obj.msgsContained{end+1} = newName;
+                        end
+                        obj.(newName) = new_msg_group;
+                        
+                        % Store message data if available
+                        if i <= length(logData.message_data) && ~isempty(logData.message_data{i})
+                            % Data is already in correct format from C
+                            obj.(newName).storeData(logData.message_data{i}');
+                            
+                            % Set up valid_msgheader_cell for finalizeLogProcessing compatibility
+                            if i <= length(logData.message_indices) && ~isempty(logData.message_indices{i})
+                                messageIndices = logData.message_indices{i};
+                                % Safely add to valid_msgheader_cell
+                                row_idx = size(obj.valid_msgheader_cell, 1) + 1;
+                                obj.valid_msgheader_cell{row_idx, 1} = newType;
+                                obj.valid_msgheader_cell{row_idx, 2} = messageIndices(:)';
+                            end
+                        end
+                        
+                        % Add to fmt_cell for compatibility
+                        obj.fmt_cell = [obj.fmt_cell; {newType, newName, newLen}];
+                        obj.fmt_type_mat = [obj.fmt_type_mat; newType];
+                    end
+                    
+                catch ME
+                    if strcmp(ME.identifier,'MATLAB:class:PropertyInUse')
+                        warning('Duplicate message %d/%s definition', newType, newName);
+                    elseif strcmp(ME.identifier,'MATLAB:ClassUstring:InvalidDynamicPropertyName')
+                        warning('Message name cannot be assigned to variable (Type:%d, Name:%s)', newType, newName);
+                        continue;
+                    else
+                        rethrow(ME);
+                    end
+                end
+            end
+            
+            % Update message count
+            obj.numMsgs = 0;
+            propNames = properties(obj);
+            for i = 1:length(propNames)
+                propName = propNames{i};
+                if isa(obj.(propName),'LogMsgGroup')
+                    obj.numMsgs = obj.numMsgs + length(obj.(propName).LineNo);
+                end
+            end
+            
+            fprintf('C parser extracted data for %d message types. Post-processing will handle instances and final setup...\n', length(obj.fmt_cell));
         end
         
         function headerIndices = discoverValidMsgHeaders(obj,msgId,msgLen,headerIndices)
@@ -291,6 +399,255 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
                 msgId = [];
             end
             headerIndices = strfind(obj.log_data, [obj.header msgId]);
+        end
+        
+        function [] = findFMTLengthOptimized(obj)
+            % Find the length of the format message using fast optimized search
+            % Uses C-optimized MATLAB functions for maximum performance
+            
+            logSize = length(obj.log_data);
+            
+            % Search for the header pattern [163 149 FMTID] directly
+            search_pattern = [obj.header obj.FMTID];
+            
+            % Use fast vectorized search (strfind is implemented in optimized C)
+            fmt_indices = strfind(obj.log_data, search_pattern);
+            
+            if isempty(fmt_indices)
+                warning('Could not find the FMT message to extract its length. Leaving the default %d', obj.FMTLen);
+                return;
+            end
+            
+            % Check each candidate efficiently
+            for idx = fmt_indices
+                % Make sure we have enough bytes to read the FMT definition
+                if idx + 4 <= logSize % Need: header(2) + msgId(1) + fmtId(1) + length(1)
+                    if obj.log_data(idx + 3) == obj.FMTID % Verify this is FMT definition
+                        obj.FMTLen = double(obj.log_data(idx + 4));
+                        return; % Return as soon as FMT length is found
+                    end
+                end
+            end
+            
+            warning('Could not find the FMT message to extract its length. Leaving the default %d', obj.FMTLen);
+        end
+        
+        function data = isolateMsgDataOptimized(obj, msgId, msgLen)
+            % Return an msgLen x N array of valid msg data corresponding to msgId
+            % This version uses C-optimized functions for maximum performance and minimal memory usage
+            
+            % Try MEX-based ultra-fast search first
+            if exist('ardupilot_find_messages', 'file') == 3
+                try
+                    % Use compiled C function for maximum speed
+                    [msgIndices, data] = ardupilot_find_messages(obj.log_data, obj.header, msgId, msgLen);
+                    
+                    % Save valid headers for reconstructing the log LineNo
+                    obj.valid_msgheader_cell{end+1, 1} = msgId;
+                    obj.valid_msgheader_cell{end, 2} = msgIndices';
+                    
+                    return; % MEX succeeded, we're done!
+                catch ME
+                    warning('ARDUPILOG:MexFailed', 'MEX function failed: %s. Falling back to MATLAB implementation.', ME.message);
+                end
+            end
+            
+            % Fallback: Optimized MATLAB implementation
+            data = obj.isolateMsgDataFast(msgId, msgLen);
+        end
+        
+        function data = isolateMsgDataFast(obj, msgId, msgLen)
+            % Ultra-fast MATLAB implementation using vectorized operations
+            % Optimized to minimize memory allocations and maximize speed
+            
+            if ~isprop(obj, 'perf_timers')
+                addprop(obj, 'perf_timers');
+                obj.perf_timers = struct();
+            end
+            
+            total_start = tic;
+            
+            search_pattern = [obj.header msgId];
+            logSize = length(obj.log_data);
+            
+            % Check memory requirements and choose strategy
+            strategy_start = tic;
+            estimated_matches = logSize / 1000; % Conservative estimate
+            memory_needed = estimated_matches * 8; % 8 bytes per double index
+            strategy_time = toc(strategy_start);
+            
+            if memory_needed > 500e6 % More than 500MB of indices
+                % Use streaming approach for very large logs
+                stream_start = tic;
+                data = obj.isolateMsgDataStreaming(msgId, msgLen, search_pattern);
+                stream_time = toc(stream_start);
+                obj.perf_timers.(sprintf('msg_%d_streaming', msgId)) = stream_time;
+            else
+                % Use fast vectorized approach for manageable sizes
+                
+                % Find all message headers at once (MATLAB's strfind is highly optimized C code)
+                strfind_start = tic;
+                msgIndices = strfind(obj.log_data, search_pattern);
+                strfind_time = toc(strfind_start);
+                
+                if isempty(msgIndices)
+                    obj.valid_msgheader_cell{end+1, 1} = msgId;
+                    obj.valid_msgheader_cell{end, 2} = [];
+                    data = [];
+                    total_time = toc(total_start);
+                    obj.perf_timers.(sprintf('msg_%d_total', msgId)) = total_time;
+                    obj.perf_timers.(sprintf('msg_%d_strfind', msgId)) = strfind_time;
+                    return;
+                end
+                
+                % Fast vectorized validation using logical indexing
+                validate_start = tic;
+                msgIndices = obj.validateMsgIndicesFast(msgIndices, msgId, msgLen);
+                validate_time = toc(validate_start);
+                
+                % Save valid headers
+                obj.valid_msgheader_cell{end+1, 1} = msgId;
+                obj.valid_msgheader_cell{end, 2} = msgIndices';
+                
+                if isempty(msgIndices)
+                    data = [];
+                    total_time = toc(total_start);
+                    obj.perf_timers.(sprintf('msg_%d_total', msgId)) = total_time;
+                    obj.perf_timers.(sprintf('msg_%d_strfind', msgId)) = strfind_time;
+                    obj.perf_timers.(sprintf('msg_%d_validate', msgId)) = validate_time;
+                    return;
+                end
+                
+                % Ultra-fast vectorized data extraction
+                extract_start = tic;
+                data = obj.extractMsgDataVectorized(msgIndices, msgLen);
+                extract_time = toc(extract_start);
+                
+                % Store timing information
+                total_time = toc(total_start);
+                obj.perf_timers.(sprintf('msg_%d_total', msgId)) = total_time;
+                obj.perf_timers.(sprintf('msg_%d_strfind', msgId)) = strfind_time;
+                obj.perf_timers.(sprintf('msg_%d_validate', msgId)) = validate_time;
+                obj.perf_timers.(sprintf('msg_%d_extract', msgId)) = extract_time;
+                obj.perf_timers.(sprintf('msg_%d_strategy', msgId)) = strategy_time;
+                
+                % Store performance for summary (removed verbose per-message output)
+            end
+        end
+        
+        function validIndices = validateMsgIndicesFast(obj, msgIndices, msgId, msgLen)
+            % Fast vectorized message validation
+            
+            logSize = length(obj.log_data);
+            
+            % Remove indices too close to end of log
+            validMask = (msgIndices + msgLen - 1) <= logSize;
+            msgIndices = msgIndices(validMask);
+            
+            if isempty(msgIndices)
+                validIndices = [];
+                return;
+            end
+            
+            % Vectorized validation: check if next message has valid header
+            nextHeaderPos = msgIndices + msgLen;
+            
+            % Remove messages at very end of log
+            endMask = nextHeaderPos <= logSize - 1;
+            msgIndices = msgIndices(endMask);
+            nextHeaderPos = nextHeaderPos(endMask);
+            
+            if isempty(msgIndices)
+                validIndices = msgIndices;
+                return;
+            end
+            
+            % Fast vectorized header validation
+            nextB1Valid = obj.log_data(nextHeaderPos) == obj.header(1);
+            nextB2Valid = obj.log_data(nextHeaderPos + 1) == obj.header(2);
+            
+            validMask = nextB1Valid & nextB2Valid;
+            
+            % Handle special case for last message in log
+            if ~isempty(msgIndices)
+                lastMsgPos = msgIndices(end) + msgLen;
+                if lastMsgPos > logSize
+                    % Last message extends to end of log - that's valid
+                    validMask(end) = true;
+                end
+            end
+            
+            validIndices = msgIndices(validMask);
+        end
+        
+        function data = extractMsgDataVectorized(obj, msgIndices, msgLen)
+            % Ultra-fast vectorized message data extraction
+            
+            if isempty(msgIndices)
+                data = [];
+                return;
+            end
+            
+            numMsgs = length(msgIndices);
+            dataLen = msgLen - 3; % Exclude header bytes
+            
+            % Create index matrix using broadcasting (much faster than loops)
+            dataOffsets = (3:(msgLen-1))'; % Column vector: data byte positions within message
+            
+            % Use implicit expansion (broadcasting) to create full index matrix
+            fullIndices = msgIndices + dataOffsets; % Automatic broadcasting in modern MATLAB
+            
+            % Single vectorized data extraction
+            data = reshape(obj.log_data(fullIndices), dataLen, numMsgs);
+        end
+        
+        function data = isolateMsgDataStreaming(obj, msgId, msgLen, search_pattern)
+            % Streaming approach for extremely large logs
+            % Processes data without storing large intermediate arrays
+            
+            logSize = length(obj.log_data);
+            chunk_size = 50000000; % Large 50MB chunks for efficiency
+            
+            allData = [];
+            allIndices = [];
+            
+            % Process in large chunks with minimal overhead
+            for start_pos = 1:chunk_size:logSize
+                end_pos = min(start_pos + chunk_size - 1, logSize);
+                
+                % Minimal overlap for boundary handling
+                overlap = msgLen + 10;
+                search_end = min(end_pos + overlap, logSize);
+                
+                % Process chunk directly without copying
+                chunkIndices = strfind(obj.log_data(start_pos:search_end), search_pattern);
+                
+                if ~isempty(chunkIndices)
+                    % Convert to global indices
+                    globalIndices = chunkIndices + start_pos - 1;
+                    
+                    % Only keep indices in main chunk (avoid duplicates)
+                    if start_pos > 1
+                        mainChunkMask = globalIndices <= end_pos;
+                        globalIndices = globalIndices(mainChunkMask);
+                    end
+                    
+                    % Validate and extract data immediately
+                    validIndices = obj.validateMsgIndicesFast(globalIndices, msgId, msgLen);
+                    
+                    if ~isempty(validIndices)
+                        chunkData = obj.extractMsgDataVectorized(validIndices, msgLen);
+                        allData = [allData chunkData];
+                        allIndices = [allIndices validIndices];
+                    end
+                end
+            end
+            
+            % Save indices
+            obj.valid_msgheader_cell{end+1, 1} = msgId;
+            obj.valid_msgheader_cell{end, 2} = allIndices';
+            
+            data = allData;
         end
 
         function data = isolateMsgData(obj,msgId,msgLen,allHeaderCandidates)

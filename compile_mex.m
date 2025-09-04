@@ -4,10 +4,11 @@ function compile_mex()
     fprintf('=== Compiling ArduPilot MEX Files ===\n\n');
     
     success_count = 0;
+    current_dir = fileparts(mfilename('fullpath'));
     
     fprintf('Compiling ArduPilot C parser...\n');
     try
-        mex('-O', 'ardupilot_parse_log.c');
+        mex('-O', current_dir + "" + '/ardupilot_parse_log.c');
         
         % Test the complete parser with a simple, well-formed test case
         header = [163, 149];

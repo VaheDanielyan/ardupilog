@@ -123,7 +123,7 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
             end
             
             % Try ultra-fast C parsing of entire log
-            if exist('ardupilot_parse_log', 'file') == 3
+            if obj.tryUseCompiledParser()
                 try
                     fprintf('Using ultra-fast C parser for entire log...\n');
                     logData = ardupilot_parse_log(obj.log_data, obj.header, obj.msgFilter);
@@ -279,6 +279,53 @@ classdef Ardupilog < dynamicprops & matlab.mixin.Copyable
             
             % Display message on completion
             disp('Done processing.');
+        end
+        
+        function available = tryUseCompiledParser(obj)
+            
+            if exist('ardupilot_parse_log', 'file') == 3
+                available = true;
+                return;
+            end
+            
+            fprintf('C parser not found. Attempting automatic compilation...\n');
+            
+            try
+                current_dir = fileparts(mfilename('fullpath'));
+                
+                c_source = fullfile(current_dir, 'ardupilot_parse_log.c');
+                if ~exist(c_source, 'file')
+                    fprintf('Source file ardupilot_parse_log.c not found. Using MATLAB fallback.\n');
+                    available = false;
+                    return;
+                end
+                
+                fprintf('Compiling C parser for maximum performance...\n');
+                old_dir = pwd;
+                cd(current_dir);
+                
+                mex('-O', 'ardupilot_parse_log.c');
+                
+                cd(old_dir);
+                
+                if exist('ardupilot_parse_log', 'file') == 3
+                    fprintf('✓ C parser compiled successfully! Future runs will be much faster.\n');
+                    available = true;
+                else
+                    fprintf('⚠ Compilation completed but MEX file not found. Using MATLAB fallback.\n');
+                    available = false;
+                end
+                
+            catch ME
+                fprintf('⚠ MEX compilation failed: %s\n', ME.message);
+                fprintf('  This is normal if you don''t have a C compiler configured.\n');
+                fprintf('  Run "mex -setup" to configure a compiler, or use MATLAB fallback.\n');
+                available = false;
+                
+                if exist('old_dir', 'var')
+                    cd(old_dir);
+                end
+            end
         end
         
         function [] = processLogDataFromC(obj, logData)
